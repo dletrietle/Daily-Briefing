@@ -1,0 +1,96 @@
+# Place this file at: .github/workflows/newsletter.yml
+#
+# Trigger design (see README for the full rationale):
+#   - TWO cron entries because cron runs in UTC and can't follow US daylight
+#     saving. One fires at 6:45am ET in summer, the other at 6:45am ET in
+#     winter; a guard step skips whichever lands outside the 6am ET hour.
+#   - A dedupe guard skips scheduled runs if a successful run already
+#     happened today (protects against double-fires and overlapping triggers).
+#   - workflow_dispatch lets you run it manually (with an optional dry-run).
+#   - repository_dispatch lets an EXTERNAL scheduler (recommended:
+#     cron-job.org hitting the GitHub API) trigger it reliably — GitHub's own
+#     cron is delayed under load and silently disabled after 60 days of repo
+#     inactivity.
+
+name: daily-market-newsletter
+
+on:
+  schedule:
+    - cron: "45 10 * * 1-5"   # 06:45 ET while US daylight saving is in effect
+    - cron: "45 11 * * 1-5"   # 06:45 ET during standard time
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the email but do not send it"
+        required: false
+        default: "false"
+  repository_dispatch:
+    types: [send-newsletter]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — ET window + once-per-day (scheduled runs only)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR_ET=$(TZ=America/New_York date +%H)
+            if [ "$HOUR_ET" != "06" ]; then
+              echo "Outside the 6am ET window (this is the DST twin cron firing) — skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            TODAY_UTC=$(date -u +%Y-%m-%d)
+            PRIOR=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/newsletter.yml/runs?status=success&created=${TODAY_UTC}..${TODAY_UTC}" \
+              --jq '.total_count' || echo 0)
+            if [ "$PRIOR" -gt 0 ]; then
+              echo "A successful run already happened today — skipping duplicate send."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Checkout
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Build and send newsletter
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NEWSLETTER_TO: ${{ secrets.NEWSLETTER_TO }}     # optional; defaults to sender
+          SEC_CONTACT: ${{ secrets.SEC_CONTACT }}         # "Your Name you@email.com" for SEC UA
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python main.py --dry-run
+          else
+            python main.py
+          fi
+
+      - name: Upload built email (debug artifact)
+        if: always() && steps.guard.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: newsletter-html
+          path: newsletter.html
+          if-no-files-found: ignore
+          retention-days: 7
